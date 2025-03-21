@@ -95,27 +95,25 @@ class IndustrialReconstruction(Node):
         self.declare_parameter("camera_info_topic")
         self.declare_parameter("cache_count", 10)
         self.declare_parameter("slop", 0.01)
+        self.declare_parameter("sampling_frame", 30)
+        self.declare_parameter("live_sampling_frame", 50)
 
-        try:
-            self.depth_image_topic = str(self.get_parameter('depth_image_topic').value)
-        except:
-            self.get_logger().error("Failed to load depth_image_topic parameter")
-        try:
-            self.color_image_topic = str(self.get_parameter('color_image_topic').value)
-        except:
-            self.get_logger().error("Failed to load color_image_topic parameter")
-        try:
-            self.camera_info_topic = str(self.get_parameter('camera_info_topic').value)
-        except:
-            self.get_logger().error("Failed to load camera_info_topic parameter")
-        try:
-            self.cache_count = int(self.get_parameter('cache_count').value)
-        except:
-            self.get_logger().info("Failed to load cache_count parameter")
-        try:
-            self.slop = float(self.get_parameter('slop').value)
-        except:
-            self.get_logger().info("Failed to load slop parameter")
+        parameters = {
+            "depth_image_topic": str,
+            "color_image_topic": str,
+            "camera_info_topic": str,
+            "cache_count": int,
+            "slop": float,
+            "sampling_frame": int,
+            "live_sampling_frame": int
+        }
+
+        for param, param_type in parameters.items():
+            try:
+                setattr(self, param, param_type(self.get_parameter(param).value))
+            except Exception as e:
+                self.get_logger().error(f"Failed to load {param} parameter: {str(e)}")
+
         allow_headerless = False
 
         self.get_logger().info("depth_image_topic - " + self.depth_image_topic)
@@ -244,6 +242,9 @@ class IndustrialReconstruction(Node):
                 rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(data[1], data[0], self.depth_scale, self.depth_trunc,
                                                                           False)
                 self.tsdf_volume.integrate(rgbd, self.intrinsics, np.linalg.inv(data[2]))
+                np_depth = np.asarray(data[0])
+                self._logger.info(f"max: {str(np.max(np_depth))}, min: {str(np.min(np_depth))}")
+                
 
         point_cloud = self.tsdf_volume.extract_point_cloud()
         if len(point_cloud.points) == 0:
@@ -305,7 +306,7 @@ class IndustrialReconstruction(Node):
             else:
                 self.sensor_data.append(
                     [o3d.geometry.Image(cv2_depth_img), o3d.geometry.Image(cv2_rgb_img), rgb_image_msg.header.stamp])
-                if (self.frame_count > 30):
+                if (self.frame_count > self.sampling_frame):
                     data = self.sensor_data.popleft()
                     try:
                         gm_tf_stamped = self.buffer.lookup_transform(self.relative_frame, self.tracking_frame, data[2])
@@ -319,7 +320,8 @@ class IndustrialReconstruction(Node):
                     tran_dist = np.linalg.norm(rgb_t - self.prev_pose_tran)
                     rot_dist = Quaternion.absolute_distance(Quaternion(self.prev_pose_rot), rgb_r_quat)
 
-                    # TODO: Testing if this is a good practice, min jump to accept data
+                    # self._logger.info(f"tran_dist: {tran_dist}, rot_dist: {rot_dist}")
+                    # TODO: Testing if this is a good practice, min jump to accept data 
                     if (tran_dist >= self.translation_distance) or (rot_dist >= self.rotational_distance):
                         self.prev_pose_tran = rgb_t
                         self.prev_pose_rot = rgb_r
@@ -331,6 +333,7 @@ class IndustrialReconstruction(Node):
                         self.depth_images.append(data[0])
                         self.color_images.append(data[1])
                         self.rgb_poses.append(rgb_pose)
+
                         if self.live_integration and self.tsdf_volume is not None:
                             self.integration_done = False
                             try:
@@ -338,9 +341,11 @@ class IndustrialReconstruction(Node):
                                                                                           self.depth_trunc, False)
                                 self.tsdf_volume.integrate(rgbd, self.intrinsics, np.linalg.inv(rgb_pose))
                                 self.integration_done = True
-                                self.processed_frame_count += 1
-                                if self.processed_frame_count % 50 == 0:
+                                self.processed_frame_count += 1 
+                                self._logger.info(f"Processed Frame Count: {self.processed_frame_count}")                               
+                                if self.processed_frame_count % self.live_sampling_frame == 0:
                                     mesh = self.tsdf_volume.extract_triangle_mesh()
+                                    self._logger.info(f"Mesh Vertices: {len(mesh.vertices)}")
                                     if self.crop_mesh:
                                         cropped_mesh = mesh.crop(self.crop_box)
                                     else:
@@ -356,6 +361,7 @@ class IndustrialReconstruction(Node):
                         else:
                             self.tsdf_integration_data.append([data[0], data[1], rgb_pose])
                             self.processed_frame_count += 1
+                            self._logger.info(f"TSDF Appendding. Processed Frame Count: {self.processed_frame_count}")
 
                 self.frame_count += 1
 
