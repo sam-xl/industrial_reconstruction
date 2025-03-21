@@ -1,9 +1,11 @@
 <?xml version="1.0"?>
 <launch>
 
-  <arg name="depth_image_topic"/>
-  <arg name="color_image_topic"/>
-  <arg name="camera_info_topic"/>
+  <arg name="depth_image_topic" default="camera/depth/image"/>
+  <arg name="color_image_topic" default="camera/color/image"/>
+  <arg name="camera_info_topic" default="camera/color/info"/>
+  <arg name="sampling_frame" default="3"/>
+  <arg name="live_sampling_frame" default="5"/>
   <arg name="cache_count" default="10"/>
   <arg name="slop" default="0.01"/>
 
@@ -13,6 +15,7 @@
     <param name="camera_info_topic" value="$(var camera_info_topic)"/>
     <param name="cache_count" value="$(var cache_count)"/>
     <param name="slop" value="$(var slop)"/>
+    <param name="sampling_frame" value="$(var sampling_frame)"/>
+    <param name="live_sampling_frame" value="$(var live_sampling_frame)"/>
   </node>
-
 </launch>
