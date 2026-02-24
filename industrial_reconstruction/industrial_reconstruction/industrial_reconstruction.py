@@ -29,7 +29,7 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 from src.industrial_reconstruction.utility.file import make_clean_folder, write_pose, read_pose, save_intrinsic_as_json, make_folder_keep_contents
 from industrial_reconstruction_msgs.srv import StartReconstruction, StopReconstruction
 from src.industrial_reconstruction.utility.ros import getIntrinsicsFromMsg, meshToRos, transformStampedToVectors
-
+import cv2
 # ROS Image message -> OpenCV2 image converter
 from cv_bridge import CvBridge, CvBridgeError
 # OpenCV2 for saving an image
@@ -307,6 +307,7 @@ class IndustrialReconstruction(Node):
                 # TODO: Generalize image type
                 cv2_depth_img = self.bridge.imgmsg_to_cv2(depth_image_msg, "16UC1")
                 cv2_rgb_img = self.bridge.imgmsg_to_cv2(rgb_image_msg, rgb_image_msg.encoding)
+                cv2_rgb_img = cv2.cvtColor(cv2_rgb_img, cv2.COLOR_RGBA2RGB)                
             except CvBridgeError:
                 self.get_logger().error("Error converting ros msg to cv img")
                 return
