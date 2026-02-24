@@ -4,8 +4,8 @@
   <arg name="depth_image_topic" default="camera/depth/image"/>
   <arg name="color_image_topic" default="camera/color/image"/>
   <arg name="camera_info_topic" default="camera/color/info"/>
-  <arg name="sampling_frame" default="3"/>
-  <arg name="live_sampling_frame" default="5"/>
+  <arg name="sampling_frame" default="0"/>
+  <arg name="live_sampling_frame" default="2"/>
   <arg name="cache_count" default="10"/>
   <arg name="slop" default="0.01"/>
 
