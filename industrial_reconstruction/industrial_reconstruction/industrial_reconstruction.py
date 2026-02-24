@@ -49,7 +49,7 @@ class IndustrialReconstruction(Node):
 
         self.bridge = CvBridge()
 
-        self.buffer = Buffer()
+        self.buffer = Buffer(rclpy.duration.Duration(seconds=30))
         self.tf_listener = TransformListener(buffer=self.buffer, node=self)
 
         self.tsdf_volume = None
