@@ -243,25 +243,21 @@ class IndustrialReconstruction(Node):
         while not self.integration_done:
             self.create_rate(1).sleep()
 
-        # Process the frames still delayed by `sampling_frame`, otherwise the last frames would be discarded
+        # Process the frames still delayed by `sampling_frame`, otherwise the last frames would be discarded.
+        # Frames that fail (e.g. no transform yet at their time stamp) are skipped, as during recording.
         while len(self.sensor_data) > 0:
-            if not self.processFrame(self.sensor_data.popleft()):
-                res.success = False
-                res.message = "Failed to process a queued frame"
-                self.get_logger().error(res.message)
-                return res
+            self.processFrame(*self.sensor_data.popleft())
         self.get_logger().info(f"Integrated {self.processed_frame_count} frames")
 
         self.get_logger().info("Generating mesh")
         if not self.live_integration:
             while len(self.tsdf_integration_data) > 0:
-                data = self.tsdf_integration_data.popleft()
-                rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(data[1], data[0], self.depth_scale, self.depth_trunc,
+                depth, color, pose = self.tsdf_integration_data.popleft()
+                rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(color, depth, self.depth_scale, self.depth_trunc,
                                                                           False)
-                self.tsdf_volume.integrate(rgbd, self.intrinsics, np.linalg.inv(data[2]))
-                np_depth = np.asarray(data[0])
+                self.tsdf_volume.integrate(rgbd, self.intrinsics, np.linalg.inv(pose))
+                np_depth = np.asarray(depth)
                 self._logger.info(f"max: {str(np.max(np_depth))}, min: {str(np.min(np_depth))}")
-                
 
         point_cloud = self.tsdf_volume.extract_point_cloud()
         if len(point_cloud.points) == 0:
@@ -318,10 +314,9 @@ class IndustrialReconstruction(Node):
         if self.record:
             try:
                 # Convert your ROS Image message to OpenCV2
-                # TODO: Generalize image type
-                cv2_depth_img = self.bridge.imgmsg_to_cv2(depth_image_msg, "32FC1")
-                cv2_rgb_img = self.bridge.imgmsg_to_cv2(rgb_image_msg, rgb_image_msg.encoding)
-                cv2_rgb_img = cv2.cvtColor(cv2_rgb_img, cv2.COLOR_RGBA2RGB)                
+                # The depth encoding (e.g. 16UC1 in mm, 32FC1 in m) must match the requested `depth_scale`
+                cv2_depth_img = self.bridge.imgmsg_to_cv2(depth_image_msg, "passthrough")
+                cv2_rgb_img = self.bridge.imgmsg_to_cv2(rgb_image_msg, "rgb8")
             except CvBridgeError:
                 self.get_logger().error("Error converting ros msg to cv img")
                 return
@@ -331,17 +326,18 @@ class IndustrialReconstruction(Node):
                 # Frames are processed with a delay of `sampling_frame` frames, so that the transform at their
                 # time stamp is available. Frames still queued when the reconstruction is stopped are processed then.
                 if (self.frame_count > self.sampling_frame):
-                    self.processFrame(self.sensor_data.popleft())
+                    if not self.processFrame(*self.sensor_data.popleft()):
+                        return
 
                 self.frame_count += 1
 
-    def processFrame(self, data):
-        """Looks up the camera pose of a queued [depth, color, stamp] frame and integrates (or stores) it.
+    def processFrame(self, depth, color, stamp):
+        """Looks up the camera pose of a queued frame and integrates (or stores) it.
 
         Returns False if the frame could not be processed.
         """
         try:
-            gm_tf_stamped = self.buffer.lookup_transform(self.relative_frame, self.tracking_frame, data[2])
+            gm_tf_stamped = self.buffer.lookup_transform(self.relative_frame, self.tracking_frame, stamp)
         except Exception as e:
             self.get_logger().error("Failed to get transform: " + str(e))
 
@@ -362,14 +358,14 @@ class IndustrialReconstruction(Node):
             rgb_pose[1, 3] = rgb_t[1]
             rgb_pose[2, 3] = rgb_t[2]
 
-            self.depth_images.append(data[0])
-            self.color_images.append(data[1])
+            self.depth_images.append(depth)
+            self.color_images.append(color)
             self.rgb_poses.append(rgb_pose)
 
             if self.live_integration and self.tsdf_volume is not None:
                 self.integration_done = False
                 try:
-                    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(data[1], data[0], self.depth_scale,
+                    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(color, depth, self.depth_scale,
                                                                               self.depth_trunc, False)
                     self.tsdf_volume.integrate(rgbd, self.intrinsics, np.linalg.inv(rgb_pose))
                     self.integration_done = True
@@ -390,7 +386,7 @@ class IndustrialReconstruction(Node):
                     self.integration_done = True
                     return False
             else:
-                self.tsdf_integration_data.append([data[0], data[1], rgb_pose])
+                self.tsdf_integration_data.append([depth, color, rgb_pose])
                 self.processed_frame_count += 1
                 self._logger.info(f"TSDF Appendding. Processed Frame Count: {self.processed_frame_count}")
 
