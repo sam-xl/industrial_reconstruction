@@ -315,7 +315,7 @@ class IndustrialReconstruction(Node):
             try:
                 # Convert your ROS Image message to OpenCV2
                 # The depth encoding (e.g. 16UC1 in mm, 32FC1 in m) must match the requested `depth_scale`
-                cv2_depth_img = self.bridge.imgmsg_to_cv2(depth_image_msg, "passthrough")
+                cv2_depth_img = self.bridge.imgmsg_to_cv2(depth_image_msg, depth_image_msg.encoding)
                 cv2_rgb_img = self.bridge.imgmsg_to_cv2(rgb_image_msg, "rgb8")
             except CvBridgeError:
                 self.get_logger().error("Error converting ros msg to cv img")
