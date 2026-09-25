@@ -15,6 +15,7 @@
 import sys
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, HistoryPolicy, ReliabilityPolicy, DurabilityPolicy
 from tf2_ros.buffer import Buffer
 from tf2_ros import TransformListener
 import open3d as o3d
@@ -22,7 +23,7 @@ import numpy as np
 
 from pyquaternion import Quaternion
 from collections import deque
-from os.path import exists, join, isfile
+from os.path import exists, join, isfile, dirname
 from sensor_msgs.msg import Image, CameraInfo
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from src.industrial_reconstruction.utility.file import make_clean_folder, write_pose, read_pose, save_intrinsic_as_json, make_folder_keep_contents
@@ -48,7 +49,7 @@ class IndustrialReconstruction(Node):
 
         self.bridge = CvBridge()
 
-        self.buffer = Buffer()
+        self.buffer = Buffer(rclpy.duration.Duration(seconds=30))
         self.tf_listener = TransformListener(buffer=self.buffer, node=self)
 
         self.tsdf_volume = None
@@ -95,27 +96,25 @@ class IndustrialReconstruction(Node):
         self.declare_parameter("camera_info_topic")
         self.declare_parameter("cache_count", 10)
         self.declare_parameter("slop", 0.01)
+        self.declare_parameter("sampling_frame", 30)
+        self.declare_parameter("live_sampling_frame", 50)
 
-        try:
-            self.depth_image_topic = str(self.get_parameter('depth_image_topic').value)
-        except:
-            self.get_logger().error("Failed to load depth_image_topic parameter")
-        try:
-            self.color_image_topic = str(self.get_parameter('color_image_topic').value)
-        except:
-            self.get_logger().error("Failed to load color_image_topic parameter")
-        try:
-            self.camera_info_topic = str(self.get_parameter('camera_info_topic').value)
-        except:
-            self.get_logger().error("Failed to load camera_info_topic parameter")
-        try:
-            self.cache_count = int(self.get_parameter('cache_count').value)
-        except:
-            self.get_logger().info("Failed to load cache_count parameter")
-        try:
-            self.slop = float(self.get_parameter('slop').value)
-        except:
-            self.get_logger().info("Failed to load slop parameter")
+        parameters = {
+            "depth_image_topic": str,
+            "color_image_topic": str,
+            "camera_info_topic": str,
+            "cache_count": int,
+            "slop": float,
+            "sampling_frame": int,
+            "live_sampling_frame": int
+        }
+
+        for param, param_type in parameters.items():
+            try:
+                setattr(self, param, param_type(self.get_parameter(param).value))
+            except Exception as e:
+                self.get_logger().error(f"Failed to load {param} parameter: {str(e)}")
+
         allow_headerless = False
 
         self.get_logger().info("depth_image_topic - " + self.depth_image_topic)
@@ -130,14 +129,20 @@ class IndustrialReconstruction(Node):
 
         self.info_sub = self.create_subscription(CameraInfo, self.camera_info_topic, self.cameraInfoCallback, 10)
 
-        self.mesh_pub = self.create_publisher(Marker, "industrial_reconstruction_mesh", 10)
+        publisher_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+        self.mesh_pub = self.create_publisher(Marker, "industrial_reconstruction_mesh", publisher_qos)
+        self.tsdf_volume_pub = self.create_publisher(Marker, "tsdf_volume", publisher_qos)
 
         self.start_server = self.create_service(StartReconstruction, 'start_reconstruction',
                                                 self.startReconstructionCallback)
         self.stop_server = self.create_service(StopReconstruction, 'stop_reconstruction',
                                                self.stopReconstructionCallback)
 
-        self.tsdf_volume_pub = self.create_publisher(Marker, "tsdf_volume", 10)
 
     def archiveData(self, path_output):
         path_depth = join(path_output, "depth")
@@ -168,9 +173,9 @@ class IndustrialReconstruction(Node):
         self.prev_pose_rot = np.array([1.0, 0.0, 0.0, 0.0])
         self.prev_pose_tran = np.array([0.0, 0.0, 0.0])
 
-        if (req.tsdf_params.min_box_values.x == req.tsdf_params.max_box_values.x and
-                req.tsdf_params.min_box_values.y == req.tsdf_params.max_box_values.y and
-                req.tsdf_params.min_box_values.z == req.tsdf_params.max_box_values.z):
+        if (np.isclose(req.tsdf_params.min_box_values.x, req.tsdf_params.max_box_values.x) and
+                np.isclose(req.tsdf_params.min_box_values.y, req.tsdf_params.max_box_values.y) and
+                np.isclose(req.tsdf_params.min_box_values.z, req.tsdf_params.max_box_values.z)):
             self.crop_mesh = False
         else:
             self.crop_mesh = True
@@ -183,6 +188,7 @@ class IndustrialReconstruction(Node):
             self.crop_box_msg.type = self.crop_box_msg.CUBE
             self.crop_box_msg.action = self.crop_box_msg.ADD
             self.crop_box_msg.id = 1
+            self.crop_box_msg.frame_locked = True
             self.crop_box_msg.scale.x = max_bound[0] - min_bound[0]
             self.crop_box_msg.scale.y = max_bound[1] - min_bound[1]
             self.crop_box_msg.scale.z = max_bound[2] - min_bound[2]
@@ -237,13 +243,21 @@ class IndustrialReconstruction(Node):
         while not self.integration_done:
             self.create_rate(1).sleep()
 
+        # Process the frames still delayed by `sampling_frame`, otherwise the last frames would be discarded.
+        # Frames that fail (e.g. no transform yet at their time stamp) are skipped, as during recording.
+        while len(self.sensor_data) > 0:
+            self.processFrame(*self.sensor_data.popleft())
+        self.get_logger().info(f"Integrated {self.processed_frame_count} frames")
+
         self.get_logger().info("Generating mesh")
         if not self.live_integration:
             while len(self.tsdf_integration_data) > 0:
-                data = self.tsdf_integration_data.popleft()
-                rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(data[1], data[0], self.depth_scale, self.depth_trunc,
+                depth, color, pose = self.tsdf_integration_data.popleft()
+                rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(color, depth, self.depth_scale, self.depth_trunc,
                                                                           False)
-                self.tsdf_volume.integrate(rgbd, self.intrinsics, np.linalg.inv(data[2]))
+                self.tsdf_volume.integrate(rgbd, self.intrinsics, np.linalg.inv(pose))
+                np_depth = np.asarray(depth)
+                self._logger.info(f"max: {str(np.max(np_depth))}, min: {str(np.min(np_depth))}")
 
         point_cloud = self.tsdf_volume.extract_point_cloud()
         if len(point_cloud.points) == 0:
@@ -274,9 +288,13 @@ class IndustrialReconstruction(Node):
         cropped_mesh.remove_unreferenced_vertices()
 
 
-        o3d.io.write_triangle_mesh(req.mesh_filepath, cropped_mesh, False, True)
+        make_folder_keep_contents(dirname(req.mesh_filepath) or ".")
+        if not o3d.io.write_triangle_mesh(req.mesh_filepath, cropped_mesh, False, True):
+            res.success = False
+            res.message = "Failed to save mesh to " + req.mesh_filepath
+            self.get_logger().error(res.message)
+            return res
         mesh_msg = meshToRos(cropped_mesh)
-        mesh_msg.header.stamp = self.get_clock().now().to_msg()
         mesh_msg.header.frame_id = self.relative_frame
         self.mesh_pub.publish(mesh_msg)
         self.get_logger().info("Mesh Saved to " + req.mesh_filepath)
@@ -289,75 +307,90 @@ class IndustrialReconstruction(Node):
 
         self.get_logger().info("DONE")
         res.success = True
-        res.message = "Mesh Saved to " + req.mesh_filepath
+        res.message = f"Mesh Saved to {req.mesh_filepath} ({self.processed_frame_count} frames integrated)"
         return res
 
     def cameraCallback(self, depth_image_msg, rgb_image_msg):
         if self.record:
             try:
                 # Convert your ROS Image message to OpenCV2
-                # TODO: Generalize image type
-                cv2_depth_img = self.bridge.imgmsg_to_cv2(depth_image_msg, "16UC1")
-                cv2_rgb_img = self.bridge.imgmsg_to_cv2(rgb_image_msg, rgb_image_msg.encoding)
+                # The depth encoding (e.g. 16UC1 in mm, 32FC1 in m) must match the requested `depth_scale`
+                cv2_depth_img = self.bridge.imgmsg_to_cv2(depth_image_msg, depth_image_msg.encoding)
+                cv2_rgb_img = self.bridge.imgmsg_to_cv2(rgb_image_msg, "rgb8")
             except CvBridgeError:
                 self.get_logger().error("Error converting ros msg to cv img")
                 return
             else:
                 self.sensor_data.append(
                     [o3d.geometry.Image(cv2_depth_img), o3d.geometry.Image(cv2_rgb_img), rgb_image_msg.header.stamp])
-                if (self.frame_count > 30):
-                    data = self.sensor_data.popleft()
-                    try:
-                        gm_tf_stamped = self.buffer.lookup_transform(self.relative_frame, self.tracking_frame, data[2])
-                    except Exception as e:
-                        self.get_logger().error("Failed to get transform: " + str(e))
-
+                # Frames are processed with a delay of `sampling_frame` frames, so that the transform at their
+                # time stamp is available. Frames still queued when the reconstruction is stopped are processed then.
+                if (self.frame_count > self.sampling_frame):
+                    if not self.processFrame(*self.sensor_data.popleft()):
                         return
-                    rgb_t, rgb_r = transformStampedToVectors(gm_tf_stamped)
-                    rgb_r_quat = Quaternion(rgb_r)
-
-                    tran_dist = np.linalg.norm(rgb_t - self.prev_pose_tran)
-                    rot_dist = Quaternion.absolute_distance(Quaternion(self.prev_pose_rot), rgb_r_quat)
-
-                    # TODO: Testing if this is a good practice, min jump to accept data
-                    if (tran_dist >= self.translation_distance) or (rot_dist >= self.rotational_distance):
-                        self.prev_pose_tran = rgb_t
-                        self.prev_pose_rot = rgb_r
-                        rgb_pose = rgb_r_quat.transformation_matrix
-                        rgb_pose[0, 3] = rgb_t[0]
-                        rgb_pose[1, 3] = rgb_t[1]
-                        rgb_pose[2, 3] = rgb_t[2]
-
-                        self.depth_images.append(data[0])
-                        self.color_images.append(data[1])
-                        self.rgb_poses.append(rgb_pose)
-                        if self.live_integration and self.tsdf_volume is not None:
-                            self.integration_done = False
-                            try:
-                                rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(data[1], data[0], self.depth_scale,
-                                                                                          self.depth_trunc, False)
-                                self.tsdf_volume.integrate(rgbd, self.intrinsics, np.linalg.inv(rgb_pose))
-                                self.integration_done = True
-                                self.processed_frame_count += 1
-                                if self.processed_frame_count % 50 == 0:
-                                    mesh = self.tsdf_volume.extract_triangle_mesh()
-                                    if self.crop_mesh:
-                                        cropped_mesh = mesh.crop(self.crop_box)
-                                    else:
-                                        cropped_mesh = mesh
-                                    mesh_msg = meshToRos(cropped_mesh)
-                                    mesh_msg.header.stamp = self.get_clock().now().to_msg()
-                                    mesh_msg.header.frame_id = self.relative_frame
-                                    self.mesh_pub.publish(mesh_msg)
-                            except Exception as e:
-                                self.get_logger().error("Error processing images into tsdf: " + str(e))
-                                self.integration_done = True
-                                return
-                        else:
-                            self.tsdf_integration_data.append([data[0], data[1], rgb_pose])
-                            self.processed_frame_count += 1
 
                 self.frame_count += 1
+
+    def processFrame(self, depth, color, stamp):
+        """Looks up the camera pose of a queued frame and integrates (or stores) it.
+
+        Returns False if the frame could not be processed.
+        """
+        try:
+            gm_tf_stamped = self.buffer.lookup_transform(self.relative_frame, self.tracking_frame, stamp)
+        except Exception as e:
+            self.get_logger().error("Failed to get transform: " + str(e))
+
+            return False
+        rgb_t, rgb_r = transformStampedToVectors(gm_tf_stamped)
+        rgb_r_quat = Quaternion(rgb_r)
+
+        tran_dist = np.linalg.norm(rgb_t - self.prev_pose_tran)
+        rot_dist = Quaternion.absolute_distance(Quaternion(self.prev_pose_rot), rgb_r_quat)
+
+        # self._logger.info(f"tran_dist: {tran_dist}, rot_dist: {rot_dist}")
+        # TODO: Testing if this is a good practice, min jump to accept data
+        if (tran_dist >= self.translation_distance) or (rot_dist >= self.rotational_distance):
+            self.prev_pose_tran = rgb_t
+            self.prev_pose_rot = rgb_r
+            rgb_pose = rgb_r_quat.transformation_matrix
+            rgb_pose[0, 3] = rgb_t[0]
+            rgb_pose[1, 3] = rgb_t[1]
+            rgb_pose[2, 3] = rgb_t[2]
+
+            self.depth_images.append(depth)
+            self.color_images.append(color)
+            self.rgb_poses.append(rgb_pose)
+
+            if self.live_integration and self.tsdf_volume is not None:
+                self.integration_done = False
+                try:
+                    rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(color, depth, self.depth_scale,
+                                                                              self.depth_trunc, False)
+                    self.tsdf_volume.integrate(rgbd, self.intrinsics, np.linalg.inv(rgb_pose))
+                    self.integration_done = True
+                    self.processed_frame_count += 1
+                    self._logger.info(f"Processed Frame Count: {self.processed_frame_count}")
+                    if self.processed_frame_count % self.live_sampling_frame == 0:
+                        mesh = self.tsdf_volume.extract_triangle_mesh()
+                        self._logger.info(f"Mesh Vertices: {len(mesh.vertices)}")
+                        if self.crop_mesh:
+                            cropped_mesh = mesh.crop(self.crop_box)
+                        else:
+                            cropped_mesh = mesh
+                        mesh_msg = meshToRos(cropped_mesh)
+                        mesh_msg.header.frame_id = self.relative_frame
+                        self.mesh_pub.publish(mesh_msg)
+                except Exception as e:
+                    self.get_logger().error("Error processing images into tsdf: " + str(e))
+                    self.integration_done = True
+                    return False
+            else:
+                self.tsdf_integration_data.append([depth, color, rgb_pose])
+                self.processed_frame_count += 1
+                self._logger.info(f"TSDF Appendding. Processed Frame Count: {self.processed_frame_count}")
+
+        return True
 
     def cameraInfoCallback(self, camera_info):
         self.intrinsics = getIntrinsicsFromMsg(camera_info)
