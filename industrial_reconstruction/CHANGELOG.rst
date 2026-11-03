@@ -2,6 +2,10 @@
 Changelog for industrial_reconstruction
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+0.1.0-samxl-0 (2026-11-05)
+--------------------------
+- Process queued frames on stop and create the mesh output directory
+
 0.1.0 (2026-03-19)
 ------------------
 - Initial version of the package from the upstream: https://github.com/ros-industrial/industrial_reconstruction
